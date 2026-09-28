@@ -9,7 +9,7 @@ em cima disso e' cobrar duas vezes pela mesma estabilidade.
 from unittest.mock import Mock, patch
 
 import pytest
-from PyQt5.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication
 
 import app_central.main as main_module
 from app_central.core.estabilizador import Estabilizador

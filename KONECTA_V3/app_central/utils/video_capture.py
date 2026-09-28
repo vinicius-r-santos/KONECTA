@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, pyqtSignal
 
 logger = logging.getLogger(__name__)
 

@@ -18,17 +18,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # pylint: disable=wrong-import-position
 # QtWebEngineWidgets EXIGE ser importado antes de existir um QApplication —
 # senão o avatar embutido falha com "must be imported before a QCoreApplication
-# instance is created". Por isso vem antes de tudo, mesmo que só seja usado na
-# coluna do avatar.
+# instance is created". Por isso vem antes de tudo.
 try:
-    from PyQt5 import QtWebEngineWidgets  # noqa: F401
-except ImportError:  # sem PyQtWebEngine o app roda sem o avatar embutido
+    from PyQt6 import QtWebEngineWidgets  # noqa: F401
+except ImportError:  # sem PyQt6-WebEngine o app roda sem o avatar embutido
     QtWebEngineWidgets = None  # type: ignore[assignment]
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QFont, QImage, QPixmap
-from PyQt5.QtWidgets import (
-    QAction,
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QFont, QImage, QPixmap
+from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
     QHBoxLayout,
@@ -48,6 +46,9 @@ import yaml
 from app_central.capture.audio import TAXA as TAXA_AUDIO
 from app_central.capture.audio import CapturaAudioWorker
 from app_central.capture.cameras import listar_cameras
+from app_central.capture.camera_virtual import (
+    CameraVirtual, ErroCameraVirtual, SaidaDeQuadros, compor_quadro,
+)
 from app_central.core.avaliacao import Avaliacao
 from app_central.core.config import Config
 from app_central.core.estabilizador import Estabilizador
@@ -59,7 +60,7 @@ from app_central.providers.base import Motores
 from app_central.providers.export_signlab import PASTA_MODELOS, descobrir_modelo
 from app_central.providers.http_texto_sinais import TextoParaSinaisHTTP
 from app_central.providers.local_sinais import SinaisLocais
-from app_central.providers.signlab_sinais import SinaisSignlab
+from app_central.providers.signlab_sinais import SinaisSignlab, sinais_visiveis
 from app_central.utils.metrics import MetricsCollector
 from app_central.utils.video_capture import VideoCaptureWorker
 from app_central.videocall.adaptadores import criar_adaptador
@@ -104,6 +105,11 @@ class KonectaIntelligenceHub(QMainWindow):
         self.avaliacao_label = None
         self.botao_avaliar = None
         self._avaliacao_inicio = 0.0
+        # câmera "KONECTA" que o Meet e o Zoom enxergam (vcam/): webcam + legenda
+        self.botao_camera_virtual = None
+        self._camera_virtual = None
+        self._saida_virtual = None
+        self._momento_confirmado = 0.0
         # a palavra na tela so' muda quando um sinal e' CONFIRMADO
         self._sinal_exibido = ""
         self._confianca_exibida = 0.0
@@ -170,6 +176,11 @@ class KonectaIntelligenceHub(QMainWindow):
         self._timer_modelo.timeout.connect(self._verificar_modelo_novo)
         self._timer_modelo.start(10_000)
 
+        # O atalho que abre tudo (C:\KONECTA\KONECTA.bat) já liga a câmera
+        # virtual: um clique a menos antes da reunião.
+        if os.environ.get("KONECTA_CAMERA_VIRTUAL") == "1":
+            QTimer.singleShot(0, self._alternar_camera_virtual)
+
     def _load_config(self) -> Dict:
         """Carrega a configuração do arquivo ``config/config.yaml``."""
         config_path = Path(__file__).parent / "config" / "config.yaml"
@@ -208,6 +219,34 @@ class KonectaIntelligenceHub(QMainWindow):
         except Exception as error:
             logger.error("Erro ao inicializar pipeline: %s", error)
 
+    def _preaquecer_modelo(self, motor) -> None:
+        """Sobe o worker do Keras em segundo plano, antes do primeiro sinal de verdade.
+
+        Medido: o worker leva ~8,5s para subir na primeira predição (import do
+        TensorFlow + montar o modelo); depois disso cada predição custa ~75ms.
+        Sem isto, os 8,5s caíam inteiros em cima do primeiro sinal que a pessoa
+        fizesse — ~2s para a janela de 30 quadros encher, MAIS ~8,5s do worker
+        subindo, quase 11s parado antes da primeira palavra. Rodar isto agora,
+        em paralelo com a câmera abrindo, esconde esse tempo: quando a primeira
+        janela de verdade fechar, o worker já está de pé.
+        """
+        def _aquecer():
+            try:
+                # _carregar() só lê metadados (rápido); é depois dela que dá
+                # para saber se o modelo é temporal (tem worker) ou estático.
+                motor._carregar()
+                if motor._export is None or not motor._export.temporal:
+                    return  # estático (.joblib): não tem worker para aquecer
+                tamanho = motor._export.tamanho_sequencia or 30
+                motor._prever_no_processo(np.zeros((tamanho, 128), dtype=np.float32))
+                logger.info("Worker de sinais dinâmicos pré-aquecido")
+            except Exception as erro:
+                # o app segue funcionando: a primeira predição de verdade
+                # simplesmente sobe o worker na hora, como antes
+                logger.warning("Pré-aquecimento do worker falhou: %s", erro)
+
+        threading.Thread(target=_aquecer, name="preaquecer-worker", daemon=True).start()
+
     def _init_motores(self) -> None:
         """Monta os motores a partir da configuração (§7).
 
@@ -233,6 +272,7 @@ class KonectaIntelligenceHub(QMainWindow):
             if caminho_signlab:
                 self.motores.sinais_para_texto = SinaisSignlab(caminho_modelo=caminho_signlab)
                 self._modelo_signlab = Path(caminho_signlab)
+                self._preaquecer_modelo(self.motores.sinais_para_texto)
             else:
                 logger.warning(
                     "Nenhum modelo em %s — exporte um experimento no SIGNLAB e "
@@ -337,6 +377,7 @@ class KonectaIntelligenceHub(QMainWindow):
             self.camera_worker = VideoCaptureWorker(camera_id=indice)
             self.camera_worker.frame_ready.connect(self._process_frame)
             self.camera_worker.frame_ready.connect(self._mostrar_preview)
+            self.camera_worker.frame_ready.connect(self._enviar_camera_virtual)
             self.camera_worker.start()
             self.is_running = True
             logger.info("Câmera iniciada")
@@ -353,11 +394,11 @@ class KonectaIntelligenceHub(QMainWindow):
         # é por onde se arrasta. Sem moldura, a janela não tinha esses botões e
         # precisava de código próprio para ser movida.
         self.setWindowFlags(
-            Qt.Window  # type: ignore[attr-defined]
-            | Qt.WindowStaysOnTopHint  # continua flutuando sobre a videochamada
-            | Qt.WindowMinimizeButtonHint
-            | Qt.WindowMaximizeButtonHint
-            | Qt.WindowCloseButtonHint
+            Qt.WindowType.Window  # type: ignore[attr-defined]
+            | Qt.WindowType.WindowStaysOnTopHint  # continua flutuando sobre a videochamada
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint
         )
 
         central_widget = QWidget()
@@ -429,7 +470,7 @@ class KonectaIntelligenceHub(QMainWindow):
     def _criar_painel_avaliacao(self) -> QLabel:
         """Mostra qual sinal fazer durante uma medição."""
         self.avaliacao_label = QLabel("")
-        self.avaliacao_label.setAlignment(Qt.AlignCenter)  # type: ignore[attr-defined]
+        self.avaliacao_label.setAlignment(Qt.AlignmentFlag.AlignCenter)  # type: ignore[attr-defined]
         self.avaliacao_label.setWordWrap(True)
         self.avaliacao_label.setStyleSheet(
             "background: #2d3a8c; color: white; border-radius: 6px;"
@@ -450,7 +491,9 @@ class KonectaIntelligenceHub(QMainWindow):
             self.avaliacao_label.show()
             return
 
-        vocabulario = sorted(str(nome) for nome in export.classes.values())
+        # sem "(nenhum)": ela nunca é confirmada, e a rodada que a sorteasse
+        # nunca fecharia
+        vocabulario = sinais_visiveis(export.classes)
         rodadas = int(os.environ.get("KONECTA_RODADAS", "20"))
         self.avaliacao = Avaliacao(vocabulario=vocabulario, rodadas_alvo=rodadas)
         self.botao_avaliar.setText("Encerrar medição")
@@ -562,7 +605,7 @@ class KonectaIntelligenceHub(QMainWindow):
         if export is None or not export.classes:
             self.vocabulario_label.setText("Nenhum modelo carregado")
             return
-        sinais = sorted(str(nome) for nome in export.classes.values())
+        sinais = sinais_visiveis(export.classes)
         modalidade = "dinâmicos" if export.temporal else "estáticos"
         self.vocabulario_label.setText(
             f"Reconhece {len(sinais)} sinais {modalidade}:  " + " · ".join(sinais)
@@ -571,8 +614,10 @@ class KonectaIntelligenceHub(QMainWindow):
     def _criar_coluna_avatar(self) -> QWidget:
         """Coluna da direita: o avatar que recebe a fala transcrita.
 
-        É a mesma página do TEXTO_PARA_LIBRAS, embutida — assim os dois sentidos
-        da conversa ficam numa janela só, sem alternar entre aplicativos.
+        É a mesma página do TEXTO_PARA_LIBRAS, embutida: os dois sentidos da
+        conversa ficam numa janela só. Exige o QtWebEngine do Qt6 (Chromium
+        140). No PyQt5 era um Chromium 83, e o VLibras 7 (set/2026) não roda
+        nele: "SyntaxError: Unexpected token '='" no vlibras-initial-*.js.
         """
         caixa = QWidget()
         coluna = QVBoxLayout(caixa)
@@ -589,20 +634,31 @@ class KonectaIntelligenceHub(QMainWindow):
             if os.environ.get("KONECTA_SEM_AVATAR") == "1":
                 raise RuntimeError("avatar desligado por configuração")
 
-            from PyQt5.QtCore import QUrl
-            from PyQt5.QtWebEngineWidgets import QWebEngineView
+            from PyQt6.QtCore import QUrl
+            from PyQt6.QtWebEngineCore import QWebEnginePage
+            from PyQt6.QtWebEngineWidgets import QWebEngineView
+
+            class PaginaAvatar(QWebEnginePage):
+                # O avatar quebrou em silêncio quando o gov.br trocou o VLibras:
+                # agora erro de JavaScript da página vai para o log.
+                def javaScriptConsoleMessage(self, nivel, mensagem, linha, origem):
+                    erro = QWebEnginePage.JavaScriptConsoleMessageLevel.ErrorMessageLevel
+                    if nivel == erro and "ws://" not in mensagem:
+                        logger.warning("Avatar (js): %s [%s:%s]", mensagem,
+                                       origem.rsplit("/", 1)[-1], linha)
 
             self.avatar_view = QWebEngineView()
+            self.avatar_view.setPage(PaginaAvatar(self.avatar_view))
             self.avatar_view.setMinimumWidth(320)
             self.avatar_view.load(QUrl(url))
             coluna.addWidget(self.avatar_view, stretch=1)
+            QTimer.singleShot(5000, self._conferir_avatar)
         except Exception as erro:
-            # sem PyQtWebEngine o resto do app continua funcionando
+            # sem PyQt6-WebEngine o resto do app continua funcionando
             logger.warning("Avatar embutido indisponível: %s", erro)
-            aviso = QLabel(
-                f"Avatar indisponível.\nAbra {url} no navegador."
-            )
-            aviso.setAlignment(Qt.AlignCenter)  # type: ignore[attr-defined]
+            aviso = QLabel(f"Avatar indisponível: abra {url} no navegador.")
+            aviso.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            aviso.setWordWrap(True)
             aviso.setStyleSheet("color: #888; font-size: 11px;")
             coluna.addWidget(aviso, stretch=1)
 
@@ -612,10 +668,30 @@ class KonectaIntelligenceHub(QMainWindow):
         coluna.addWidget(self.audio_label)
         return caixa
 
+    def _conferir_avatar(self, tentativas: int = 36) -> None:
+        """Registra no log quando o avatar fica pronto, ou que não ficou em 3 min.
+
+        A primeira carga do VLibras 7 leva ~40 s. Sem este registro, "não
+        carregou" só aparecia quando alguém olhava a tela.
+        """
+        if self.avatar_view is None:
+            return
+
+        def recebido(status):
+            if status == "pronto":
+                logger.info("Avatar pronto")
+            elif tentativas > 0:
+                QTimer.singleShot(5000, lambda: self._conferir_avatar(tentativas - 1))
+            else:
+                logger.warning("Avatar não ficou pronto em 3 min (status: %s)", status)
+
+        self.avatar_view.page().runJavaScript(
+            "document.getElementById('status')?.textContent", recebido)
+
     def _criar_label_candidato(self) -> QLabel:
         """Linha discreta com o sinal em análise, abaixo da palavra confirmada."""
         self.candidato_label = QLabel("aguardando sinal…")
-        self.candidato_label.setAlignment(Qt.AlignCenter)  # type: ignore[attr-defined]
+        self.candidato_label.setAlignment(Qt.AlignmentFlag.AlignCenter)  # type: ignore[attr-defined]
         self.candidato_label.setStyleSheet("color: #888; font-size: 11px;")
         return self.candidato_label
 
@@ -675,7 +751,7 @@ class KonectaIntelligenceHub(QMainWindow):
     def _criar_preview(self) -> QLabel:
         """Imagem ao vivo da câmera: é como a pessoa se enquadra."""
         self.preview_label = QLabel("aguardando câmera…")
-        self.preview_label.setAlignment(Qt.AlignCenter)  # type: ignore[attr-defined]
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)  # type: ignore[attr-defined]
         self.preview_label.setMinimumHeight(240)
         self.preview_label.setStyleSheet(
             "background-color: #111; color: #888; border-radius: 4px;"
@@ -733,14 +809,14 @@ class KonectaIntelligenceHub(QMainWindow):
             self._desenhar_maos(imagem)
             altura, largura, _ = imagem.shape
             qimagem = QImage(
-                imagem.data, largura, altura, 3 * largura, QImage.Format_RGB888
+                imagem.data, largura, altura, 3 * largura, QImage.Format.Format_RGB888
             )
             self.preview_label.setPixmap(
                 QPixmap.fromImage(qimagem).scaled(
                     self.preview_label.width(),
                     self.preview_label.height(),
-                    Qt.KeepAspectRatio,  # type: ignore[attr-defined]
-                    Qt.SmoothTransformation,  # type: ignore[attr-defined]
+                    Qt.AspectRatioMode.KeepAspectRatio,  # type: ignore[attr-defined]
+                    Qt.TransformationMode.SmoothTransformation,  # type: ignore[attr-defined]
                 )
             )
         except Exception as erro:
@@ -831,12 +907,20 @@ class KonectaIntelligenceHub(QMainWindow):
         )
         self.botao_avaliar.clicked.connect(self._alternar_avaliacao)
 
+        self.botao_camera_virtual = QPushButton("Câmera virtual: desligada")
+        self.botao_camera_virtual.setToolTip(
+            "Cria a câmera 'KONECTA' para o Meet e o Zoom: a sua imagem com a "
+            "legenda do sinal embaixo, para quem não sabe Libras"
+        )
+        self.botao_camera_virtual.clicked.connect(self._alternar_camera_virtual)
+
         clear_btn = QPushButton("Limpar")
         clear_btn.clicked.connect(self._clear_history)
 
         controls_layout.addWidget(self.start_btn)
         controls_layout.addWidget(self.stop_btn)
         controls_layout.addWidget(self.botao_avaliar)
+        controls_layout.addWidget(self.botao_camera_virtual)
         controls_layout.addWidget(clear_btn)
         return controls_layout
 
@@ -992,7 +1076,9 @@ class KonectaIntelligenceHub(QMainWindow):
         # ele devolve vazio nos frames entre predições. Tratar isso como mão
         # ausente reiniciava o candidato a cada 2 frames, e nenhuma predição
         # jamais completava o hold: 119 predições de 100% sem uma confirmação.
-        if resultado.detalhes.get("status") == "sem_maos":
+        # "sem_sinal" é a classe "(nenhum)": mão em quadro fazendo outra coisa,
+        # que para o candidato conta como se ela tivesse parado de sinalizar.
+        if resultado.detalhes.get("status") in ("sem_maos", "sem_sinal"):
             self.estabilizador.sem_maos()
         confirmado = (
             self.estabilizador.avaliar(resultado.texto, resultado.confianca)
@@ -1005,6 +1091,7 @@ class KonectaIntelligenceHub(QMainWindow):
         # sinais várias vezes por segundo — ilegível para quem está sinalizando.
         if confirmado is not None:
             self._sinal_exibido = confirmado.texto
+            self._momento_confirmado = time.monotonic()
             self._confianca_exibida = confirmado.confianca
             # durante uma medição, cada confirmação fecha uma rodada
             if self.avaliacao is not None:
@@ -1227,8 +1314,65 @@ class KonectaIntelligenceHub(QMainWindow):
         """Encerra a aplicação a partir do menu do tray."""
         self.close()
 
+    # A legenda fica na imagem por este tempo depois de confirmada. Mais que
+    # isso, quem está na chamada leria uma palavra antiga como se fosse nova.
+    _LEGENDA_S = 5.0
+
+    def _alternar_camera_virtual(self) -> None:
+        """Liga ou desliga a câmera "KONECTA" que o Meet e o Zoom enxergam."""
+        if self._camera_virtual is not None:
+            self._desligar_camera_virtual()
+            return
+        try:
+            self._camera_virtual = CameraVirtual()
+        except ErroCameraVirtual as erro:
+            from PyQt6.QtWidgets import QMessageBox
+
+            logger.error("Câmera virtual: %s", erro)
+            QMessageBox.warning(self, "Câmera virtual",
+                                f"Não foi possível ligar a câmera virtual: {erro}")
+            return
+        self._saida_virtual = SaidaDeQuadros()
+        self.botao_camera_virtual.setText("Câmera virtual: ligada")
+        logger.info("Câmera virtual ligada")
+        if self.tray is not None:
+            self.tray.showMessage(
+                "KONECTA", "Câmera virtual ligada. No Meet ou no Zoom, escolha a câmera KONECTA.")
+
+    def _desligar_camera_virtual(self) -> None:
+        if self._saida_virtual is not None:
+            self._saida_virtual.fechar()
+            self._saida_virtual = None
+        if self._camera_virtual is not None:
+            try:
+                self._camera_virtual.desligar()
+            except Exception as erro:
+                logger.warning("Câmera virtual: erro ao desligar: %s", erro)
+            self._camera_virtual = None
+            logger.info("Câmera virtual desligada")
+        if self.botao_camera_virtual is not None:
+            self.botao_camera_virtual.setText("Câmera virtual: desligada")
+
+    def _enviar_camera_virtual(self, frame: np.ndarray) -> None:
+        """Manda o quadro da webcam, com a legenda do último sinal, para a câmera virtual.
+
+        O quadro vai sem espelho: é assim que os outros participantes o recebem.
+        O Meet espelha só a própria imagem de quem transmite, então ela verá a
+        legenda invertida na tela dela e os outros a verão certa.
+        """
+        if self._saida_virtual is None:
+            return
+        legenda = None
+        if self._sinal_exibido and time.monotonic() - self._momento_confirmado < self._LEGENDA_S:
+            legenda = self._sinal_exibido.upper()
+        try:
+            self._saida_virtual.escrever(compor_quadro(frame, legenda))
+        except Exception as erro:  # a chamada não pode derrubar o reconhecimento
+            logger.warning("Câmera virtual: quadro não enviado: %s", erro)
+
     def closeEvent(self, event) -> None:
         """Encerramento seguro: corta captura, fecha motores e para o loop (§10)."""
+        self._desligar_camera_virtual()
         if self.camera_worker:
             self.camera_worker.stop()
         self.gerenciador.desligar_tudo()
@@ -1285,7 +1429,7 @@ def main() -> None:
     app.setStyle("Fusion")
 
     if _ja_esta_aberto():
-        from PyQt5.QtWidgets import QMessageBox
+        from PyQt6.QtWidgets import QMessageBox
 
         logger.warning("Já existe uma janela do KONECTA aberta; encerrando esta")
         QMessageBox.warning(
@@ -1301,7 +1445,7 @@ def main() -> None:
     window.show()
 
     logger.info("KONECTA Intelligence Hub iniciado")
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

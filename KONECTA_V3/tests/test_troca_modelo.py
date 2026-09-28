@@ -105,3 +105,30 @@ def test_worker_com_acento_e_liberar_encerra_o_processo(monkeypatch):
 
     assert processo.poll() is not None, "worker do modelo antigo continuou vivo"
     assert motor._processo is None
+
+
+def test_preaquecimento_sobe_o_worker_antes_do_primeiro_sinal():
+    """O worker precisa estar de pé quando a 1a janela de verdade fechar."""
+    from unittest.mock import Mock, patch
+
+    from PyQt6.QtWidgets import QApplication
+
+    import app_central.main as main_module
+    from app_central.main import KonectaIntelligenceHub
+    from app_central.providers.signlab_sinais import SinaisSignlab
+
+    _app = QApplication.instance() or QApplication([])
+    with patch.object(main_module, "VideoCaptureWorker", Mock()), \
+         patch.object(main_module, "listar_cameras", lambda: []), \
+         patch.dict("os.environ", {"KONECTA_MODELO_SIGNLAB": str(ZIP)}):
+        hub = KonectaIntelligenceHub()
+    motor = hub.motores.sinais_para_texto
+    assert isinstance(motor, SinaisSignlab)
+
+    for _ in range(100):  # o aquecimento roda numa thread; espera terminar
+        if motor._processo is not None and motor._export is not None:
+            break
+        time.sleep(0.1)
+    assert motor._processo is not None, "worker não subiu no pré-aquecimento"
+    assert motor._processo.poll() is None, "worker subiu e já morreu"
+    motor.liberar()

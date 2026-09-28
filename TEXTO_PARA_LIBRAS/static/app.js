@@ -17,13 +17,22 @@ function definirStatus(texto, classe) {
   status.className = classe;
 }
 
-// O widget só instancia o player (window.plugin) depois de aberto, e só passa a
-// responder ao clique após seu próprio window.onload — daí a retentativa.
+// O widget só instancia o player (window.plugin) depois de aberto.
+// VLibras 7 (set/2026, servido pelo jsDelivr): abre por VLibrasWidget.open() e
+// vive num shadow DOM. O [vw-access-button] do index.html continua na página
+// mas perdeu o clique — clicar nele deixava o avatar em "carregando" para sempre.
+// A primeira carga do avatar leva ~40s; as seguintes vêm do cache.
 function aguardarPlugin() {
   return new Promise((resolve) => {
+    let aberto = false;
     const checar = () => {
       if (window.plugin?.translate) return resolve(window.plugin);
-      document.querySelector("[vw-access-button]")?.click();
+      // Uma vez só: antes de carregar, cada open() injeta o script de novo.
+      // open() ainda não existe nos primeiros ms (o carregador cria no DOMContentLoaded).
+      if (!aberto && window.VLibrasWidget?.open) {
+        window.VLibrasWidget.open();
+        aberto = true;
+      }
       setTimeout(checar, 1000);
     };
     checar();
@@ -88,16 +97,17 @@ function conectar() {
   };
 }
 
-// player.setSpeed() chega ao avatar, mas o botão do widget mantém o rótulo
-// dele: ficaria escrito "1x" rodando a 1.5x, e o próximo clique do usuário
-// partiria do estado errado. Clicar no botão mantém rótulo e player em sincronia.
-// Insiste até o rótulo bater: o botão só é desenhado depois que o avatar carrega
-// e, mesmo depois de existir, ainda passa um tempo com o clique sem efeito —
-// por isso conferimos o resultado a cada tentativa em vez de clicar 3x e torcer.
+// Na VLibras 7 o player não expõe setSpeed: a velocidade é uma lista de opções
+// (0.5x a 2.5x, com ponto) no shadow DOM, que o botão "Alterar velocidade" só
+// mostra — clicar nele não troca nada. Clicar na opção mantém rótulo e avatar em
+// sincronia. Insiste até o rótulo bater: a lista só existe depois que o avatar
+// carrega, por isso conferimos a cada tentativa em vez de clicar e torcer.
 function aplicarVelocidade(tentativas = 90) {
-  const botao = document.querySelector(".vpw-button-speed");
-  if (botao?.textContent.trim() === `${VELOCIDADE}x`) return;
-  botao?.click();
+  const raiz = document.getElementById("vlibras-app-root")?.shadowRoot;
+  const semEspaco = (el) => el?.textContent.replace(/\s/g, "");
+  const alvo = `${VELOCIDADE}x`;
+  if (semEspaco(raiz?.querySelector('button[aria-label="Alterar velocidade"]')) === alvo) return;
+  [...(raiz?.querySelectorAll("li > button") || [])].find((b) => semEspaco(b) === alvo)?.click();
   if (tentativas > 0) setTimeout(() => aplicarVelocidade(tentativas - 1), 500);
 }
 

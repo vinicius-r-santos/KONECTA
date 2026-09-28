@@ -172,7 +172,7 @@ class AdaptadorMeet(AdaptadorVideochamada):
             return False
         self.ultimo_texto = texto
         try:
-            from PyQt5.QtWidgets import QApplication
+            from PyQt6.QtWidgets import QApplication
 
             app = QApplication.instance()
             if app is None:

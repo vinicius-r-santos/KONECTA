@@ -29,6 +29,7 @@ import logging
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -51,6 +52,21 @@ TAMANHO_VETOR = 128
 PONTOS_POR_MAO = 21
 _PUNHO = 0
 _MEDIO_MCP = 9
+
+
+# Classe treinada com gestos que NÃO são sinal: coçar o rosto, digitar, ajeitar
+# o cabelo, mãos paradas. Sem ela o modelo sempre escolhe um dos sinais quando
+# há mão em quadro, e numa reunião qualquer gesto vira palavra na legenda.
+CLASSE_NENHUM = "(nenhum)"
+
+
+def e_nenhum(nome) -> bool:
+    return str(nome).strip().casefold() == CLASSE_NENHUM
+
+
+def sinais_visiveis(classes: Dict[Any, str]) -> List[str]:
+    """Os sinais que a interface mostra e mede: todos menos "(nenhum)"."""
+    return sorted(str(nome) for nome in classes.values() if not e_nenhum(nome))
 
 
 def normalizar_mao(pontos) -> np.ndarray:
@@ -107,6 +123,7 @@ class SinaisSignlab(SinaisParaTextoProvider):
         self._export: Optional[ModeloSignlab] = None
         self._detector: Any = None
         self._mp: Any = None
+        self._relogio_video = time.monotonic()  # base do timestamp exigido pelo modo VIDEO
         self._lock = threading.Lock()  # o detector do MediaPipe não é thread-safe
         self._lock_processo = threading.Lock()
         #: ultimo par de maos detectado, para a UI desenhar o esqueleto
@@ -200,12 +217,19 @@ class SinaisSignlab(SinaisParaTextoProvider):
                     "hand_landmarker.task não encontrado; sem ele não há extração de mãos"
                 )
             self._mp = mp
+            # VIDEO em vez de IMAGE: entre quadros vizinhos a mão quase não se
+            # move, e neste modo o MediaPipe reaproveita o rastreamento em vez
+            # de rodar o detector de palma inteiro a cada quadro — é a mesma
+            # ideia do "passo_predicao", mas dentro do próprio MediaPipe.
+            # Herda o ganho do rastreamento sem mudar o vetor de 128 features
+            # nem os modelos já treinados: aqui só muda COMO a mão é achada.
             self._detector = mp_vision.HandLandmarker.create_from_options(
                 mp_vision.HandLandmarkerOptions(
                     base_options=BaseOptions(model_asset_path=str(caminho)),
-                    running_mode=mp_vision.RunningMode.IMAGE,
+                    running_mode=mp_vision.RunningMode.VIDEO,
                     num_hands=2,
                     min_hand_detection_confidence=0.5,
+                    min_tracking_confidence=0.5,
                 )
             )
         return self._detector
@@ -236,7 +260,12 @@ class SinaisSignlab(SinaisParaTextoProvider):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         imagem = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
         with self._lock:  # o detector não é thread-safe
-            resultado = detector.detect(imagem)
+            # timestamp em ms desde a criação do detector: precisa ser
+            # estritamente crescente (exigência do modo VIDEO), e um relógio
+            # monotônico garante isso mesmo com quadros descartados pela
+            # backpressure — nunca anda para trás.
+            marca_ms = int((time.monotonic() - self._relogio_video) * 1000)
+            resultado = detector.detect_for_video(imagem, marca_ms)
 
         maos: Dict[str, Optional[List]] = {"left_hand": None, "right_hand": None}
         for marcas, lado in zip(resultado.hand_landmarks, resultado.handedness):
@@ -275,7 +304,7 @@ class SinaisSignlab(SinaisParaTextoProvider):
             raise ProviderIndisponivel(f"falha ao carregar modelo: {erro}") from erro
 
         if self._export is not None and self._export.temporal:
-            return await self._reconhecer_temporal(frame, inicio)
+            return self._filtrar_nenhum(await self._reconhecer_temporal(frame, inicio))
 
         try:
             # joblib.load e MediaPipe seguram a thread por centenas de ms (o
@@ -309,7 +338,7 @@ class SinaisSignlab(SinaisParaTextoProvider):
         if confianca < self.confianca_minima:
             texto = ""
 
-        return ResultadoTexto(
+        return self._filtrar_nenhum(ResultadoTexto(
             texto=texto,
             confianca=confianca,
             latencia_ms=(time.monotonic() - inicio) * 1000,
@@ -318,7 +347,15 @@ class SinaisSignlab(SinaisParaTextoProvider):
                 "maos": sum(1 for v in maos.values() if v),
                 "modelo": self.caminho_modelo.name,
             },
-        )
+        ))
+
+    @staticmethod
+    def _filtrar_nenhum(resultado: ResultadoTexto) -> ResultadoTexto:
+        """Predição de "(nenhum)" não é texto: é a pessoa não sinalizando."""
+        if not e_nenhum(resultado.texto):
+            return resultado
+        return replace(resultado, texto="",
+                       detalhes={**resultado.detalhes, "status": "sem_sinal"})
 
     def _prever(self, vetor: np.ndarray):
         entrada = vetor.reshape(1, -1)

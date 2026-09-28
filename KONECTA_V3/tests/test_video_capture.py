@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
-from PyQt5.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication
 
 from app_central.utils.video_capture import (
     AUDIO_FRAMES_PER_BUFFER,

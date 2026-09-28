@@ -9,7 +9,7 @@ import asyncio
 from unittest.mock import Mock, patch
 
 import pytest
-from PyQt5.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication
 
 import app_central.main as main_module
 

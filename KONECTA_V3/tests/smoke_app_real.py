@@ -12,7 +12,7 @@ import threading
 import time
 from pathlib import Path
 
-from PyQt5.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 

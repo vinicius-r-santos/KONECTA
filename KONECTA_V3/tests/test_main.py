@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt5.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication
 
 import app_central.main as main_module
 from app_central.main import (

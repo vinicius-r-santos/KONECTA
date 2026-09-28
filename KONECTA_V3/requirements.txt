@@ -17,10 +17,9 @@ scipy>=1.10.0
 PyYAML>=6.0
 
 # Interface desktop (app_central)
-PyQt5>=5.15.0
-# Avatar do VLibras embutido na janela. Sem isto a coluna do avatar some
-# e o audio so' vira texto -- ja aconteceu por nao estar declarado aqui.
-PyQtWebEngine>=5.15.0
+# Qt6: o QtWebEngine do PyQt5 é um Chromium 83 e o VLibras 7 não roda nele.
+PyQt6>=6.11.0
+PyQt6-WebEngine>=6.11.0
 
 # Providers e infraestrutura
 anthropic>=0.40.0     # motor_claude_logic (validacao contextual)
