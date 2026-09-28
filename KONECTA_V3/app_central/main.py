@@ -53,6 +53,7 @@ from app_central.core.avaliacao import Avaliacao
 from app_central.core.config import Config
 from app_central.core.estabilizador import Estabilizador
 from app_central.core.sessao import Estado, GerenciadorSessao, rotulo
+from app_central.empacotado import congelado, executavel_irmao, pasta_dados_do_usuario
 from app_central.infra.resiliencia import mensagem_amigavel
 from app_central.pipeline.recognizer_pipeline import PipelineResult, RecognizerPipeline
 from app_central.providers.audio_local import AudioLocalWhisper
@@ -66,10 +67,16 @@ from app_central.utils.video_capture import VideoCaptureWorker
 from app_central.videocall.adaptadores import criar_adaptador
 # pylint: enable=wrong-import-position
 
+# Instalado, "Program Files" não é gravável por um usuário comum — escrever
+# ali falhava em silêncio (ou ia parar na pasta virtualizada do Windows, sem
+# ninguém saber onde procurar o log). Em desenvolvimento nada muda: continua
+# a mesma pasta do projeto de sempre.
+_PASTA_LOG = pasta_dados_do_usuario() / "logs"
+_PASTA_LOG.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("logs/app_central.log")],
+    handlers=[logging.StreamHandler(), logging.FileHandler(str(_PASTA_LOG / "app_central.log"), encoding="utf-8")],
 )
 logger = logging.getLogger(__name__)
 
@@ -247,6 +254,39 @@ class KonectaIntelligenceHub(QMainWindow):
 
         threading.Thread(target=_aquecer, name="preaquecer-worker", daemon=True).start()
 
+    def _garantir_avatar_no_ar(self) -> None:
+        """Sobe o servidor do avatar sozinho, se instalado e ainda não estiver de pé.
+
+        Em desenvolvimento não faz nada: quem roda do código já sabe subir o
+        servidor à parte (ou o KONECTA.pyw sobe por você). No instalador não
+        existe essa etapa manual — o clique no atalho precisa bastar sozinho,
+        então o próprio KONECTA.exe verifica e, se faltar, liga o
+        ``avatar_server.exe`` irmão.
+        """
+        if not congelado():
+            return
+        import socket
+        import subprocess
+
+        url = self.configuracao.texto_para_sinais.url
+        host_porta = url.split("//", 1)[-1].split("/", 1)[0]
+        host, _, porta = host_porta.partition(":")
+        try:
+            with socket.create_connection((host or "127.0.0.1", int(porta or 80)), timeout=0.3):
+                return  # já está no ar
+        except OSError:
+            pass
+
+        exe = executavel_irmao("avatar_server.exe")
+        if exe is None:
+            logger.warning("avatar_server.exe não encontrado ao lado do KONECTA.exe")
+            return
+        subprocess.Popen(
+            [str(exe)], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        logger.info("Servidor do avatar iniciado (%s)", exe)
+
     def _init_motores(self) -> None:
         """Monta os motores a partir da configuração (§7).
 
@@ -255,6 +295,7 @@ class KonectaIntelligenceHub(QMainWindow):
         (ver ANALISE_E_PLANO_GAUNTLET.md, ciclo 9). Sem ele, cai no motor
         embutido, que exige ``models/v1``.
         """
+        self._garantir_avatar_no_ar()
         # Ordem: variável de ambiente (útil para testar um modelo específico),
         # depois o que estiver em models/. O caminho normal é o segundo: exportar
         # no SIGNLAB e largar o arquivo lá.
@@ -1425,6 +1466,14 @@ def _ja_esta_aberto() -> bool:
 
 def main() -> None:
     """Função principal da aplicação."""
+    if congelado():
+        # Instalado, o atalho abre o KONECTA.exe direto: não passa pelo
+        # KONECTA.pyw, que é quem define estes padrões em desenvolvimento.
+        # setdefault: quem quiser outro valor ainda pode sobrescrever.
+        os.environ.setdefault("KONECTA_CAMERA_VIRTUAL", "1")
+        os.environ.setdefault("KONECTA_LIMIAR", "0.60")
+        os.environ.setdefault("KONECTA_AUDIO_ATIVO", "true")
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 

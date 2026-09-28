@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
+from app_central.empacotado import congelado, executavel_irmao
 from app_central.providers.base import (
     ProviderIndisponivel,
     ResultadoTexto,
@@ -124,6 +125,7 @@ class SinaisSignlab(SinaisParaTextoProvider):
         self._detector: Any = None
         self._mp: Any = None
         self._relogio_video = time.monotonic()  # base do timestamp exigido pelo modo VIDEO
+        self._ultima_marca_ms = -1
         self._lock = threading.Lock()  # o detector do MediaPipe não é thread-safe
         self._lock_processo = threading.Lock()
         #: ultimo par de maos detectado, para a UI desenhar o esqueleto
@@ -260,12 +262,12 @@ class SinaisSignlab(SinaisParaTextoProvider):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         imagem = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
         with self._lock:  # o detector não é thread-safe
-            # timestamp em ms desde a criação do detector: precisa ser
-            # estritamente crescente (exigência do modo VIDEO), e um relógio
-            # monotônico garante isso mesmo com quadros descartados pela
-            # backpressure — nunca anda para trás.
-            marca_ms = int((time.monotonic() - self._relogio_video) * 1000)
-            resultado = detector.detect_for_video(imagem, marca_ms)
+            # O modo VIDEO exige marca ESTRITAMENTE crescente. O relógio
+            # monotônico nunca volta, mas dois quadros em rajada caem no mesmo
+            # milissegundo — o "+1" empurra o segundo para frente.
+            agora_ms = int((time.monotonic() - self._relogio_video) * 1000)
+            self._ultima_marca_ms = max(agora_ms, self._ultima_marca_ms + 1)
+            resultado = detector.detect_for_video(imagem, self._ultima_marca_ms)
 
         maos: Dict[str, Optional[List]] = {"left_hand": None, "right_hand": None}
         for marcas, lado in zip(resultado.hand_landmarks, resultado.handedness):
@@ -490,24 +492,38 @@ class SinaisSignlab(SinaisParaTextoProvider):
         return np.stack(vetores)
 
     @staticmethod
-    def _python_do_worker() -> str:
-        """Interpretador que roda o worker temporal.
+    def _comando_worker(caminho_modelo: str) -> list:
+        """Comando completo para subir o worker temporal.
 
-        Precisa ser um ambiente **com** TensorFlow — e o da GUI não pode ter,
+        Precisa de um ambiente **com** TensorFlow — e o da GUI não pode ter,
         porque a simples presença do pacote faz o MediaPipe importá-lo e a DLL
-        falhar sob PyQt5 (medido: app processa 0 frames com TF instalado, 655
-        sem). Por isso a venv separada.
+        falhar sob PyQt (medido: app processa 0 frames com TF instalado, 655
+        sem). Por isso vive isolado: numa venv separada em desenvolvimento, ou
+        no seu próprio executável (outro build, com o TensorFlow dele) quando
+        instalado — ver app_central/empacotado.py.
         """
+        if congelado():
+            exe = executavel_irmao("sinais_worker.exe")
+            if exe is not None:
+                return [str(exe), caminho_modelo]
+            raise ProviderIndisponivel(
+                "temporal/sinais_worker.exe não encontrado ao lado do KONECTA.exe "
+                "— instalação incompleta"
+            )
+
         dedicada = Path(__file__).resolve().parents[2] / ".venv-temporal" / "Scripts" / "python.exe"
         if dedicada.is_file():
-            return str(dedicada)
-        logger.warning(
-            "%s não existe; usando o Python da GUI, que provavelmente não tem "
-            "TensorFlow. Crie a venv com: python -m venv .venv-temporal && "
-            ".venv-temporal\\Scripts\\pip install keras tensorflow-cpu numpy",
-            dedicada,
-        )
-        return sys.executable
+            interpretador = str(dedicada)
+        else:
+            logger.warning(
+                "%s não existe; usando o Python da GUI, que provavelmente não tem "
+                "TensorFlow. Crie a venv com: python -m venv .venv-temporal && "
+                ".venv-temporal\\Scripts\\pip install keras tensorflow-cpu numpy",
+                dedicada,
+            )
+            interpretador = sys.executable
+        roteiro = Path(__file__).parent / "sinais_worker.py"
+        return [interpretador, "-u", str(roteiro), caminho_modelo]
 
     def _prever_no_processo(self, sequencia: np.ndarray):
         """Manda a janela para o worker e recebe a predição.
@@ -521,9 +537,8 @@ class SinaisSignlab(SinaisParaTextoProvider):
 
         with self._lock_processo:
             if self._processo is None or self._processo.poll() is not None:
-                roteiro = Path(__file__).parent / "sinais_worker.py"
                 self._processo = subprocess.Popen(
-                    [self._python_do_worker(), "-u", str(roteiro), str(self.caminho_modelo)],
+                    self._comando_worker(str(self.caminho_modelo)),
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,

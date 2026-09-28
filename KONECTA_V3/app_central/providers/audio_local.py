@@ -28,6 +28,7 @@ from typing import Any, Optional
 
 import numpy as np
 
+from app_central.empacotado import congelado, executavel_irmao
 from app_central.providers.base import (
     AudioParaTextoProvider,
     ProviderIndisponivel,
@@ -160,10 +161,24 @@ class AudioLocalWhisper(AudioParaTextoProvider):
         if self._processo is not None and self._processo.poll() is None:
             return self._processo
 
-        roteiro = Path(__file__).parent / "whisper_worker.py"
+        args = [self.modelo, self.dispositivo, self.tipo_computacao, self.idioma]
+        if congelado():
+            # instalado: mesmo binário do KONECTA.exe, isolado por processo à
+            # toa — mas o build também gera whisper_worker.exe como irmão, e
+            # reaproveitar o comando de sempre custaria mais que usar o pronto.
+            exe = executavel_irmao("whisper_worker.exe")
+            if exe is None:
+                raise RuntimeError(
+                    "whisper_worker.exe não encontrado ao lado do KONECTA.exe "
+                    "— instalação incompleta"
+                )
+            comando = [str(exe), *args]
+        else:
+            roteiro = Path(__file__).parent / "whisper_worker.py"
+            comando = [sys.executable, "-u", str(roteiro), *args]
+
         self._processo = subprocess.Popen(
-            [sys.executable, "-u", str(roteiro), self.modelo, self.dispositivo,
-             self.tipo_computacao, self.idioma],
+            comando,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,

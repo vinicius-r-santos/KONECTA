@@ -21,6 +21,7 @@ import json
 import struct
 import sys
 import warnings
+from pathlib import Path
 
 import numpy as np
 
@@ -44,6 +45,11 @@ def _carregar(nome: str, dispositivo: str, tipo: str):
 
 def main() -> int:
     nome = sys.argv[1] if len(sys.argv) > 1 else "small"
+    # Instalado, o modelo vem dentro do instalador (_internal/whisper/<nome>):
+    # sem isto a primeira fala baixaria ~460MB da internet, calada.
+    embutido = Path(getattr(sys, "_MEIPASS", "")) / "whisper" / nome
+    if getattr(sys, "frozen", False) and embutido.is_dir():
+        nome = str(embutido)
     dispositivo = sys.argv[2] if len(sys.argv) > 2 else "cpu"
     tipo = sys.argv[3] if len(sys.argv) > 3 else "int8"
     idioma = sys.argv[4] if len(sys.argv) > 4 else "pt"

@@ -185,3 +185,20 @@ def test_sem_maos_no_frame_nao_e_erro(monkeypatch, tmp_path):
     r = asyncio.run(p.reconhecer(np.zeros((48, 64, 3), dtype=np.uint8)))
     assert r.texto == ""
     assert r.detalhes["status"] == "sem_maos"
+
+
+@pytest.mark.skipif(
+    SinaisSignlab(caminho_modelo="x")._caminho_landmarker() is None,
+    reason="sem hand_landmarker.task",
+)
+def test_quadros_no_mesmo_milissegundo_nao_quebram_o_modo_video():
+    """O modo VIDEO do MediaPipe exige marca de tempo ESTRITAMENTE crescente.
+
+    Quadros em rajada (o "Medir acurácia" processa gravações em sequência, e o
+    início da câmera entrega um lote de uma vez) caem no mesmo milissegundo —
+    visto no build instalado: "Input timestamp must be monotonically increasing".
+    """
+    motor = SinaisSignlab(caminho_modelo="x")  # só a extração: o modelo não é carregado
+    quadro = np.zeros((48, 64, 3), dtype=np.uint8)
+    for _ in range(20):  # bem mais rápido que 1 quadro/ms
+        motor._extrair_maos(quadro)
