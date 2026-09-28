@@ -20,10 +20,15 @@ RAIZ = Path(SPECPATH).resolve().parent  # KONECTA_V3/
 TEXTO_PARA_LIBRAS = RAIZ.parent / "TEXTO_PARA_LIBRAS"
 ICONE = str(RAIZ.parent / "konecta.ico")
 
-# O modelo que sai "de fábrica" no instalador. Pode ser trocado depois por
-# quem instalar: basta largar outro .zip do SIGNLAB em models\, do jeito que
-# já funciona em desenvolvimento (descobrir_modelo() pega sempre o mais novo).
-MODELO_DE_FABRICA = RAIZ / "models" / "signlab_sinais-teste_exp3_20260927-1649.zip"
+# O modelo que sai "de fábrica" no instalador: o mesmo que o KONECTA de
+# desenvolvimento está usando (o .zip mais novo em models\). Já foi um nome
+# fixo, e um retreino (Pai/Mãe corrigidos) teria ficado de fora do instalador.
+import sys  # noqa: E402
+
+sys.path.insert(0, str(RAIZ))
+from app_central.providers.export_signlab import descobrir_modelo  # noqa: E402
+
+MODELO_DE_FABRICA = descobrir_modelo()
 LANDMARKER = RAIZ / "models" / "hand_landmarker.task"
 if not LANDMARKER.is_file():
     LANDMARKER = Path("C:/KONECTA/SIGNLAB/vision/models/hand_landmarker.task")
